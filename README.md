@@ -81,6 +81,12 @@ npx wrangler dev
 # open http://localhost:8787/ to see the current live reading
 ```
 
+Preview every notification type in your channel (tagged `[demo]`, no push):
+
+```
+DISCORD_WEBHOOK_URL="..." DISCORD_USER_ID="..." npm run demo
+```
+
 Inspect production state:
 
 ```

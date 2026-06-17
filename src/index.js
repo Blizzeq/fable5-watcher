@@ -164,7 +164,7 @@ async function tick(env) {
   }
 }
 
-function buildMessage(kind, { cfg, env, incident, now, blindChecks }) {
+export function buildMessage(kind, { cfg, env, incident, now, blindChecks }) {
   const id = env.DISCORD_USER_ID;
   const link = incident && incident.url ? incident.url : undefined;
   const source = { text: "Source: status.claude.com" };
@@ -228,11 +228,7 @@ function buildMessage(kind, { cfg, env, incident, now, blindChecks }) {
   }
 }
 
-async function send(env, msg) {
-  if (!env.DISCORD_WEBHOOK_URL) {
-    console.log("DISCORD_WEBHOOK_URL is not set, skipping notification");
-    return;
-  }
+export function webhookBody(msg, env) {
   const body = {
     content: msg.content || "",
     allowed_mentions: msg.mention && env.DISCORD_USER_ID
@@ -240,11 +236,18 @@ async function send(env, msg) {
       : { parse: [] },
   };
   if (msg.embeds && msg.embeds.length) body.embeds = msg.embeds;
+  return body;
+}
 
+async function send(env, msg) {
+  if (!env.DISCORD_WEBHOOK_URL) {
+    console.log("DISCORD_WEBHOOK_URL is not set, skipping notification");
+    return;
+  }
   const res = await fetch(env.DISCORD_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(webhookBody(msg, env)),
   });
   if (!res.ok) console.log(`Discord webhook returned ${res.status}: ${await res.text()}`);
 }

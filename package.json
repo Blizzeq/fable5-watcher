@@ -9,6 +9,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
+    "demo": "node scripts/demo.mjs",
     "test": "node --test",
     "check": "node --check src/index.js"
   },
