@@ -1,80 +1,84 @@
 # fable5-watcher
 
-Cloudflare Worker, który **co 60 sekund** sprawdza, czy model `claude-fable-5` jest
-dostępny, i — w momencie powrotu — wysyła **ping na Discord** (push na telefon).
-Działa w chmurze, za darmo, bez włączonego komputera.
+Cloudflare Worker, który **co 60 sekund** sprawdza, czy model **Fable 5** jest
+dostępny, i powiadamia Cię na **Discordzie**, gdy wróci. Działa w chmurze, za
+darmo, bez włączonego komputera i **bez klucza API / bez kredytów**.
 
-## Jak to działa
+## Jak wykrywa dostępność (ważne)
 
-```
-Cron co 60 s → Worker scheduled()
-   → isAvailable():
-        ANTHROPIC_API_KEY ustawiony? → GET /v1/models, szukaj "claude-fable-5"
-        inaczej (lub błąd)           → GET status.claude.com/api/v2/summary.json
-   → porównaj z KV "available"
-   → przejście niedostępny→dostępny? → POST Discord webhook (ping <@USER_ID>)
-   → zapisz nowy stan do KV
-```
+Źródłem prawdy jest **oficjalna strona statusu Anthropic**:
+`https://status.claude.com/api/v2/incidents/unresolved.json`
 
-Ping leci **tylko raz** — w momencie powrotu. Stan trzymany jest w Workers KV, więc
-nie ma spamu co minutę. Jeśli model znów spadnie i wróci, dostaniesz kolejny ping.
+Fable 5 jest traktowany jako **NIEDOSTĘPNY**, dopóki istnieje nierozwiązany
+incydent dotyczący „Fable 5" (obecnie: *„We've suspended access to Claude Mythos 5
+and Claude Fable 5"*, dotyczy m.in. **Claude Code** i **claude.ai**). Gdy ten
+incydent zostanie rozwiązany i zniknie z listy → **Fable 5 jest znowu dostępny**.
 
-**Koszt: 0 zł.** Cloudflare free (1440 wywołań/dobę << 100k limit), listowanie modeli
-Anthropic jest darmowe, Discord webhook darmowy.
+**Dlaczego nie developerskie API:**
+- `GET /v1/models` listuje `claude-fable-5` nawet gdy w produkcie jest „unavailable" → **fałszywy alarm**.
+- `POST /v1/messages` wymaga kredytów i dotyczy API dla deweloperów, a nie produktu (Claude Code/claude.ai).
+- Strona statusu jest darmowa, bez logowania i **wprost wymienia Claude Code** jako objęty incydentem — czyli zgadza się z tym, co widzisz w aplikacji.
 
-## Wymagania (jednorazowo)
+## Logika powiadomień (watcher)
 
-1. **Cloudflare** — darmowe konto, potem `npx wrangler login`.
-2. **Klucz API Anthropic** — `console.anthropic.com` → Settings → API Keys → Create Key (`sk-ant-...`).
-   Samo listowanie modeli nie zużywa kredytów. (Bez klucza działa fallback na stronę statusu.)
-3. **Discord webhook** — Ustawienia serwera → Integracje → Webhooki → Nowy webhook → wybierz kanał → **Kopiuj URL**.
-4. **Discord User ID** — Ustawienia → Zaawansowane → włącz **Tryb dewelopera** → PPM na swoją nazwę → **Kopiuj ID**.
+Stan trzymany w Workers KV; sprawdzenie co 60 s. Reguły:
+
+| Sytuacja | Co robi |
+|---|---|
+| **Powrót** (niedostępny → dostępny) | 🎉 ping z @oznaczeniem (push). Wymaga 2 kolejnych potwierdzeń (anty-miganie). |
+| **Spadek** (dostępny → niedostępny) | ⚠️ ping z @oznaczeniem. |
+| **Wciąż niedostępny** | ⏳ status co `HEARTBEAT_HOURS` (domyślnie 3 h), bez push (tylko wiadomość na kanale). |
+| **Pierwszy start** | ✅ „Watcher uzbrojony — Fable 5 obecnie: …". |
+| **Brak odczytu** (strona statusu nieosiągalna) | nic — nie zmienia stanu, nie powiadamia. |
+| **Wciąż dostępny** | cisza (zero spamu). |
+
+Ustawienia na górze [`src/index.js`](src/index.js): `HEARTBEAT_HOURS`,
+`HEARTBEAT_PINGS_YOU` (czy heartbeat ma robić push), `CONFIRM_UP_CHECKS`.
+
+**Koszt: 0 zł** — strona statusu jest darmowa; 1440 wywołań/dobę << darmowy limit Cloudflare (100k/dobę).
 
 ## Konfiguracja i deploy
 
 ```bash
 npm install
-
-# 1) Utwórz przestrzeń KV i wklej zwrócone `id` do wrangler.toml ([[kv_namespaces]].id)
-npx wrangler kv namespace create FABLE_STATE
-
-# 2) Wstaw swoje Discord User ID do wrangler.toml ([vars].DISCORD_USER_ID)
-
-# 3) Ustaw sekrety
-npx wrangler secret put ANTHROPIC_API_KEY      # wklej sk-ant-...
-npx wrangler secret put DISCORD_WEBHOOK_URL     # wklej URL webhooka
-
-# 4) Wdróż (aktywuje cron)
+npx wrangler kv namespace create FABLE_STATE   # wklej `id` do wrangler.toml
+# wstaw swoje Discord User ID do wrangler.toml ([vars].DISCORD_USER_ID)
+npx wrangler secret put DISCORD_WEBHOOK_URL      # wklej URL webhooka Discord
 npx wrangler deploy
 ```
+
+> Klucz `ANTHROPIC_API_KEY` **nie jest już potrzebny** (metoda nie używa API). Jeśli wcześniej go ustawiłeś: `npx wrangler secret delete ANTHROPIC_API_KEY`.
 
 ## Test / weryfikacja
 
 ```bash
-# Testowy ping od razu (sprawdza webhook + push):
-#   otwórz w przeglądarce:
-#   https://fable5-watcher.<twoja-subdomena>.workers.dev/?test=ping
+# Lokalny test detekcji na żywej stronie statusu:
+node --input-type=module -e "import('./src/index.js').then(m=>m.checkStatus()).then(console.log)"
 
-# Aktualny wykryty stan (JSON):
-#   https://fable5-watcher.<twoja-subdomena>.workers.dev/
+# Testowy ping na Discord (lokalnie, po uzupełnieniu .dev.vars):
+npx wrangler dev
+#   -> otwórz http://localhost:8787/?test=ping
 
-# Lokalnie — symulacja crona:
-cp .dev.vars.example .dev.vars   # uzupełnij wartości
-npx wrangler dev --test-scheduled
-curl "http://localhost:8787/__scheduled"
+# Aktualny stan w KV (produkcja):
+npx wrangler kv key get "status" --binding=FABLE_STATE --remote   # 'down' | 'up'
 
-# Wymuszenie testu przejścia (ustaw stan na "false", potem poczekaj na cron):
-npx wrangler kv key put --binding=FABLE_STATE available false
-
-# Logi na żywo (widać każde uruchomienie co 60 s):
+# Logi na żywo (każde uruchomienie co 60 s):
 npx wrangler tail
+```
+
+## Zarządzanie
+
+```bash
+npx wrangler deploy        # po zmianie ustawień
+npx wrangler delete        # całkowicie usuń watcher
+# zmiana częstotliwości: pole `crons` w wrangler.toml (min. granulacja Cloudflare: 1 min)
 ```
 
 ## Pliki
 
 | Plik | Rola |
 |------|------|
-| `src/index.js` | logika Workera (`scheduled` + `fetch` do testów) |
-| `wrangler.toml` | konfiguracja: cron, KV, `DISCORD_USER_ID` |
+| `src/index.js` | Worker: detekcja (status.claude.com) + maszyna stanów + Discord |
+| `wrangler.toml` | konfiguracja: cron `* * * * *`, KV, `DISCORD_USER_ID` |
 | `.dev.vars.example` | szablon lokalnych sekretów (skopiuj do `.dev.vars`) |
 | `package.json` | skrypty + `wrangler` |

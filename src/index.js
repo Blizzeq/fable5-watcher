@@ -1,132 +1,122 @@
 // Fable 5 availability watcher — Cloudflare Worker
 //
-// Co 60 sekund (Cron Trigger) sprawdza, czy model `claude-fable-5`
-// jest znowu dostępny i — w momencie powrotu — wysyła ping na Discord.
+// SYGNAŁ PRAWDY: oficjalna strona statusu Anthropic (status.claude.com).
+// Fable 5 jest NIEDOSTĘPNY, dopóki istnieje nierozwiązany incydent dotyczący
+// "Fable 5" (obecnie: "We've suspended access to Claude Mythos 5 and Claude Fable 5",
+// status "monitoring", dotyczy m.in. Claude Code i claude.ai).
+// Gdy ten incydent zniknie z listy nierozwiązanych (status -> resolved) => Fable 5 wraca.
 //
-// Metody detekcji:
-//   1) Anthropic Models API  (gdy ustawiony ANTHROPIC_API_KEY) — darmowe, dokładne
-//   2) Publiczna strona statusu status.claude.com (fallback bez klucza) — best-effort
-//
-// Stan trzymany w KV (binding FABLE_STATE), żeby pingować tylko przy zmianie.
+// Dlaczego NIE /v1/models ani /v1/messages:
+//   - /v1/models listuje claude-fable-5 nawet gdy w produkcie jest "unavailable" => fałszywy alarm,
+//   - /v1/messages wymaga kredytów i dotyczy developerskiego API, nie produktu (Claude Code/claude.ai).
+// Strona statusu jest darmowa, bez logowania i wprost wymienia Claude Code jako objęty incydentem.
 
-const MODEL_ID = "claude-fable-5";
-const STATUS_SUMMARY_URL = "https://status.claude.com/api/v2/summary.json";
+// ── Ustawienia (śmiało zmieniaj) ─────────────────────────────────────────────
+const HEARTBEAT_HOURS = 3;          // co ile godzin przypominać "wciąż niedostępny"
+const HEARTBEAT_PINGS_YOU = false;  // czy heartbeat ma Cię @oznaczać (push). Powrót Fable 5 ZAWSZE pinguje.
+const CONFIRM_UP_CHECKS = 2;        // ile kolejnych odczytów "dostępny" zanim ogłosimy powrót (anty-miganie)
+
+const UNRESOLVED_URL = "https://status.claude.com/api/v2/incidents/unresolved.json";
+const MATCH = /fable\s*5/i;
+const HEARTBEAT_MS = HEARTBEAT_HOURS * 60 * 60 * 1000;
 
 export default {
-  // Wywoływane przez Cron Trigger co 60 s.
+  // Cron Trigger co 60 s.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(checkAndNotify(env));
+    ctx.waitUntil(tick(env));
   },
 
-  // Endpoint pomocniczy do ręcznych testów:
-  //   /?test=ping  -> wysyła testowe powiadomienie (z @oznaczeniem) na Discord
-  //   /            -> zwraca aktualnie wykryty stan dostępności
+  // Pomocniczy endpoint do ręcznych testów (działa pod `wrangler dev`):
+  //   /?test=ping -> wysyła testowe powiadomienie    /  -> zwraca aktualny odczyt
   async fetch(request, env) {
     const url = new URL(request.url);
-
     if (url.searchParams.get("test") === "ping") {
-      await notifyDiscord(
-        env,
-        `<@${env.DISCORD_USER_ID}> 🔔 Test: webhook działa — tak będzie wyglądać powiadomienie o powrocie Fable 5.`
-      );
-      return json({ ok: true, action: "test-ping-sent" });
+      await notify(env, `<@${env.DISCORD_USER_ID}> 🔔 Test fable5-watcher — webhook działa.`, true);
+      return json({ ok: true, action: "test-ping" });
     }
-
-    const available = await isAvailable(env);
-    const prev = await env.FABLE_STATE.get("available");
-    return json({
-      model: MODEL_ID,
-      available,
-      lastKnownState: prev,
-      method: env.ANTHROPIC_API_KEY ? "anthropic-api" : "status-page",
-    });
+    return json(await checkStatus());
   },
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Detekcja dostępności
-// ─────────────────────────────────────────────────────────────────────────────
-
-export async function isAvailable(env) {
-  // 1) Metoda główna — Anthropic /v1/models (darmowa, nie zużywa kredytów)
-  if (env.ANTHROPIC_API_KEY) {
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/models?limit=1000", {
-        headers: {
-          "x-api-key": env.ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01",
-        },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const found = (data.data || []).some(
-          (m) => m.id === MODEL_ID || (typeof m.id === "string" && m.id.startsWith(MODEL_ID))
-        );
-        console.log(`[check] anthropic-api → available=${found}`);
-        return found;
-      }
-      console.log(`[check] anthropic-api zwrócił ${res.status} — przechodzę na fallback`);
-    } catch (err) {
-      console.log(`[check] błąd anthropic-api: ${err} — przechodzę na fallback`);
-    }
-  }
-
-  // 2) Fallback bez klucza — publiczna strona statusu (Atlassian Statuspage v2)
+// ── Detekcja ─────────────────────────────────────────────────────────────────
+// Zwraca { state: 'up' | 'down' | 'unknown', incident: {name, startedAt, url} | null }
+export async function checkStatus() {
   try {
-    const res = await fetch(STATUS_SUMMARY_URL, {
-      headers: { "user-agent": "fable5-watcher" },
-    });
+    const res = await fetch(UNRESOLVED_URL, { headers: { "user-agent": "fable5-watcher" } });
     if (!res.ok) {
-      console.log(`[check] status-page zwrócił ${res.status} — zakładam niedostępny`);
-      return false;
+      console.log(`[check] status.claude.com -> HTTP ${res.status} -> unknown`);
+      return { state: "unknown", incident: null };
     }
     const data = await res.json();
-    const matchesFable = (s) => /fable\s*5/i.test(s || "");
-
-    // Jeśli istnieje komponent dla Fable 5 — bazuj na jego statusie.
-    const component = (data.components || []).find((c) => matchesFable(c.name));
-    if (component) {
-      const ok = component.status === "operational";
-      console.log(`[check] status-page komponent "${component.name}" status=${component.status} → available=${ok}`);
-      return ok;
+    const hit = (data.incidents || []).find((i) => {
+      const text = (i.name || "") + " " + (i.incident_updates || []).map((u) => u.body || "").join(" ");
+      return i.status !== "resolved" && MATCH.test(text);
+    });
+    if (hit) {
+      console.log(`[check] aktywny incydent Fable 5 (status=${hit.status}) -> down`);
+      return { state: "down", incident: { name: hit.name, startedAt: hit.started_at, url: hit.shortlink } };
     }
-
-    // Inaczej: dostępny, jeśli nie ma nierozwiązanego incydentu o Fable 5.
-    const text = (i) =>
-      (i.name || "") + " " + (i.incident_updates || []).map((u) => u.body || "").join(" ");
-    const aktywneZawieszenie = (data.incidents || []).some(
-      (i) => i.status !== "resolved" && matchesFable(text(i))
-    );
-    const ok = !aktywneZawieszenie;
-    console.log(`[check] status-page incydenty → aktywneZawieszenie=${aktywneZawieszenie} → available=${ok}`);
-    return ok;
+    console.log("[check] brak incydentu Fable 5 -> up");
+    return { state: "up", incident: null };
   } catch (err) {
-    console.log(`[check] błąd status-page: ${err} — zakładam niedostępny`);
-    return false;
+    console.log(`[check] błąd: ${err} -> unknown`);
+    return { state: "unknown", incident: null };
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Logika powiadomień (anty-spam przez KV)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Logika watchera (maszyna stanów + heartbeat) ─────────────────────────────
+export async function tick(env) {
+  const { state, incident } = await checkStatus();
 
-export async function checkAndNotify(env) {
-  const available = await isAvailable(env);
-  const prev = await env.FABLE_STATE.get("available");
+  // Nie znamy stanu (np. strona statusu nieosiągalna) — nic nie zmieniamy i nie powiadamiamy.
+  if (state === "unknown") return;
 
-  // Ping tylko w momencie powrotu: dostępny teraz, a wcześniej nie był.
-  if (available && prev !== "true") {
-    console.log("[notify] przejście niedostępny→dostępny — wysyłam ping");
-    await notifyDiscord(
-      env,
-      `<@${env.DISCORD_USER_ID}> 🎉 **Fable 5** (\`${MODEL_ID}\`) jest znowu dostępny!`
-    );
+  const kv = env.FABLE_STATE;
+  const now = Date.now();
+  const prev = (await kv.get("status")) || "";                       // '', 'up', 'down'
+  let upStreak = parseInt((await kv.get("upStreak")) || "0", 10);
+  let lastDownPing = parseInt((await kv.get("lastDownPing")) || "0", 10);
+
+  // Anty-miganie: powrót ogłaszamy dopiero po N kolejnych odczytach "up".
+  upStreak = state === "up" ? upStreak + 1 : 0;
+  await kv.put("upStreak", String(upStreak));
+
+  // Stan docelowy: 'up' dopiero po potwierdzeniu; 'down' natychmiast; inaczej brak zmiany.
+  let desired = null;
+  if (state === "up" && upStreak >= CONFIRM_UP_CHECKS) desired = "up";
+  else if (state === "down") desired = "down";
+  if (desired === null) return; // "up" jeszcze niepotwierdzony — czekamy na kolejny odczyt
+
+  if (desired !== prev) {
+    // ── ZMIANA STANU ──
+    if (desired === "up") {
+      await notify(env, `<@${env.DISCORD_USER_ID}> 🎉 **Fable 5 jest znowu dostępny!** Incydent na status.claude.com rozwiązany. Sprawdź Claude Code / claude.ai.`, true);
+    } else {
+      // desired === 'down'
+      if (prev === "up") {
+        await notify(env, `<@${env.DISCORD_USER_ID}> ⚠️ **Fable 5 znów niedostępny**${incident ? ` — ${incident.name}` : ""}. Monitoruję dalej i dam znać, gdy wróci.`, true);
+      } else {
+        // pierwszy start watchera
+        await notify(env, `<@${env.DISCORD_USER_ID}> ✅ Watcher uzbrojony. **Fable 5 obecnie: NIEDOSTĘPNY**${incident ? ` (${incident.name})` : ""}. Powiadomię, gdy wróci. Status „wciąż niedostępny" co ${HEARTBEAT_HOURS} h.${incident && incident.url ? `\n${incident.url}` : ""}`, true);
+      }
+      lastDownPing = now;
+      await kv.put("lastDownPing", String(now));
+    }
+    await kv.put("status", desired);
+    return;
   }
 
-  await env.FABLE_STATE.put("available", available ? "true" : "false");
+  // ── BEZ ZMIANY STANU ──
+  if (desired === "down" && now - lastDownPing >= HEARTBEAT_MS) {
+    const since = incident && incident.startedAt ? ` (od ${incident.startedAt.slice(0, 10)})` : "";
+    await notify(env, `⏳ **Fable 5** wciąż niedostępny${since}. Monitoruję co 60 s; kolejny status za ${HEARTBEAT_HOURS} h.`, HEARTBEAT_PINGS_YOU);
+    await kv.put("lastDownPing", String(now));
+  }
+  // desired === 'up' i bez zmiany => cisza (żadnego spamu)
 }
 
-export async function notifyDiscord(env, content) {
+// ── Discord ──────────────────────────────────────────────────────────────────
+async function notify(env, content, mention) {
   if (!env.DISCORD_WEBHOOK_URL) {
     console.log("[notify] brak DISCORD_WEBHOOK_URL — pomijam");
     return;
@@ -136,12 +126,12 @@ export async function notifyDiscord(env, content) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       content,
-      allowed_mentions: { parse: [], users: env.DISCORD_USER_ID ? [env.DISCORD_USER_ID] : [] },
+      allowed_mentions: mention && env.DISCORD_USER_ID
+        ? { parse: [], users: [env.DISCORD_USER_ID] }
+        : { parse: [] },
     }),
   });
-  if (!res.ok) {
-    console.log(`[notify] Discord webhook zwrócił ${res.status}: ${await res.text()}`);
-  }
+  if (!res.ok) console.log(`[notify] Discord HTTP ${res.status}: ${await res.text()}`);
 }
 
 function json(obj) {

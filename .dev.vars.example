@@ -1,6 +1,6 @@
 # Skopiuj ten plik do `.dev.vars` (gitignored) na potrzeby lokalnych testów `wrangler dev`.
-# W produkcji te wartości ustawiasz przez `wrangler secret put ...`, NIE tutaj.
+# W produkcji DISCORD_WEBHOOK_URL ustawiasz przez `wrangler secret put`, a
+# DISCORD_USER_ID jest w wrangler.toml ([vars]). Klucz API nie jest potrzebny.
 
-ANTHROPIC_API_KEY="sk-ant-..."
 DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/XXXX/YYYY"
 DISCORD_USER_ID="123456789012345678"
