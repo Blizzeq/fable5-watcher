@@ -86,7 +86,7 @@ export function decide({ reading, prev, now, cfg }) {
   const out = [];
 
   if (reading === "unknown") {
-    s.unknownStreak = prev.unknownStreak + 1;
+    s.unknownStreak = Math.min(prev.unknownStreak + 1, cfg.unknownAlertChecks);
     if (s.unknownStreak >= cfg.unknownAlertChecks && prev.unknownAlerted !== 1) {
       out.push("blind");
       s.unknownAlerted = 1;
@@ -98,11 +98,13 @@ export function decide({ reading, prev, now, cfg }) {
   s.unknownStreak = 0;
   s.unknownAlerted = 0;
 
+  // Streaks are capped at their confirmation thresholds so that a steady state
+  // serializes to the same value every run, which lets the Worker skip KV writes.
   if (reading === "up") {
-    s.upStreak = prev.upStreak + 1;
+    s.upStreak = Math.min(prev.upStreak + 1, cfg.confirmUp);
     s.downStreak = 0;
   } else {
-    s.downStreak = prev.downStreak + 1;
+    s.downStreak = Math.min(prev.downStreak + 1, cfg.confirmDown);
     s.upStreak = 0;
   }
 
@@ -138,7 +140,26 @@ async function tick(env) {
   const { state: reading, incident } = await checkStatus(cfg.regex);
 
   const kv = env.FABLE_STATE;
-  const prev = {
+  const raw = await kv.get("state");
+  const prev = raw ? JSON.parse(raw) : await migrateState(kv);
+
+  const now = Date.now();
+  const { state, notifications } = decide({ reading, prev, now, cfg });
+
+  // Persist only when the state actually changes. With capped streaks a steady
+  // state serializes identically every run, so this keeps daily KV writes far
+  // below the free tier limit (1000 per day) instead of writing on every tick.
+  const next = JSON.stringify(state);
+  if (next !== raw) await kv.put("state", next);
+
+  for (const kind of notifications) {
+    await send(env, buildMessage(kind, { cfg, env, incident, now, blindChecks: state.unknownStreak }));
+  }
+}
+
+// Reads the previous per-key layout once so upgrading does not re-announce.
+async function migrateState(kv) {
+  return {
     status: (await kv.get("status")) || "",
     upStreak: int(await kv.get("upStreak")),
     downStreak: int(await kv.get("downStreak")),
@@ -146,22 +167,6 @@ async function tick(env) {
     unknownStreak: int(await kv.get("unknownStreak")),
     unknownAlerted: int(await kv.get("unknownAlerted")),
   };
-
-  const now = Date.now();
-  const { state, notifications } = decide({ reading, prev, now, cfg });
-
-  await Promise.all([
-    kv.put("status", state.status),
-    kv.put("upStreak", String(state.upStreak)),
-    kv.put("downStreak", String(state.downStreak)),
-    kv.put("lastDownPing", String(state.lastDownPing)),
-    kv.put("unknownStreak", String(state.unknownStreak)),
-    kv.put("unknownAlerted", String(state.unknownAlerted)),
-  ]);
-
-  for (const kind of notifications) {
-    await send(env, buildMessage(kind, { cfg, env, incident, now, blindChecks: state.unknownStreak }));
-  }
 }
 
 export function buildMessage(kind, { cfg, env, incident, now, blindChecks }) {

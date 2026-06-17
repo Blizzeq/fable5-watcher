@@ -83,3 +83,11 @@ test("a known read clears the unknown tracking", () => {
   assert.equal(state.unknownStreak, 0);
   assert.equal(state.unknownAlerted, 0);
 });
+
+test("a steady state serializes identically so KV writes can be skipped", () => {
+  const prev = base({ status: "down", downStreak: cfg.confirmDown, lastDownPing: 1000 });
+  const { state, notifications } = decide({ reading: "down", prev, now: 2000, cfg });
+  assert.deepEqual(notifications, []);
+  assert.equal(state.downStreak, cfg.confirmDown); // capped, does not grow
+  assert.deepEqual(state, prev); // identical, so the Worker writes nothing
+});
