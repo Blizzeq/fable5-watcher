@@ -2,25 +2,29 @@ name = "fable5-watcher"
 main = "src/index.js"
 compatibility_date = "2026-06-01"
 
-# Worker działa z Cron Trigger (nie potrzebuje publicznego adresu HTTP).
-# Wyłączamy workers.dev, żeby deploy nie wymagał rejestrowania subdomeny.
+# The Worker runs from a Cron Trigger and needs no public HTTP route.
 workers_dev = false
 
-# Cron Trigger — co 60 sekund
+# Run every 60 seconds (Cloudflare cron granularity is 1 minute).
 [triggers]
 crons = ["* * * * *"]
 
-# Nie-sekretna zmienna: Twoje Discord User ID (Developer Mode → Copy User ID).
-# Wstaw tutaj swoje ID przed deployem.
-[vars]
-DISCORD_USER_ID = "411994932954267650"
-
-# Pamięć stanu (poprzedni status). Uzupełnij `id` po komendzie:
+# Persisted state between runs. Create the namespace with:
 #   wrangler kv namespace create FABLE_STATE
+# then paste the returned id below.
 [[kv_namespaces]]
 binding = "FABLE_STATE"
 id = "4940a6c6867f45539cdb50413eab89ba"
 
-# Sekrety (NIE trzymaj ich w tym pliku) — ustaw komendami:
-#   wrangler secret put ANTHROPIC_API_KEY
+# Optional overrides. Defaults live in src/index.js.
+# [vars]
+# WATCH_LABEL = "Fable 5"
+# WATCH_PATTERN = "fable\\s*5"
+# HEARTBEAT_HOURS = "3"
+# HEARTBEAT_PINGS = "false"
+# CONFIRM_UP = "2"
+# CONFIRM_DOWN = "1"
+
+# Secrets (never commit these). Set them with:
 #   wrangler secret put DISCORD_WEBHOOK_URL
+#   wrangler secret put DISCORD_USER_ID

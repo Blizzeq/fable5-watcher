@@ -1,138 +1,284 @@
-// Fable 5 availability watcher — Cloudflare Worker
+// Claude model availability watcher (Cloudflare Worker).
 //
-// SYGNAŁ PRAWDY: oficjalna strona statusu Anthropic (status.claude.com).
-// Fable 5 jest NIEDOSTĘPNY, dopóki istnieje nierozwiązany incydent dotyczący
-// "Fable 5" (obecnie: "We've suspended access to Claude Mythos 5 and Claude Fable 5",
-// status "monitoring", dotyczy m.in. Claude Code i claude.ai).
-// Gdy ten incydent zniknie z listy nierozwiązanych (status -> resolved) => Fable 5 wraca.
+// Source of truth: the official Anthropic status page
+// (https://status.claude.com/api/v2/incidents/unresolved.json).
 //
-// Dlaczego NIE /v1/models ani /v1/messages:
-//   - /v1/models listuje claude-fable-5 nawet gdy w produkcie jest "unavailable" => fałszywy alarm,
-//   - /v1/messages wymaga kredytów i dotyczy developerskiego API, nie produktu (Claude Code/claude.ai).
-// Strona statusu jest darmowa, bez logowania i wprost wymienia Claude Code jako objęty incydentem.
+// The watched model is treated as UNAVAILABLE while an unresolved incident whose
+// text matches the configured pattern exists. When that incident is resolved and
+// leaves the unresolved feed, the model is treated as AVAILABLE again.
+//
+// The developer API is intentionally not used as the signal:
+//   - GET /v1/models lists the model even when the product shows it as unavailable.
+//   - POST /v1/messages requires credits and reflects the API surface, not the
+//     product (Claude Code, claude.ai), which is what users actually see.
+// The status feed is free, needs no key, and explicitly lists Claude Code as affected.
 
-// ── Ustawienia (śmiało zmieniaj) ─────────────────────────────────────────────
-const HEARTBEAT_HOURS = 3;          // co ile godzin przypominać "wciąż niedostępny"
-const HEARTBEAT_PINGS_YOU = false;  // czy heartbeat ma Cię @oznaczać (push). Powrót Fable 5 ZAWSZE pinguje.
-const CONFIRM_UP_CHECKS = 2;        // ile kolejnych odczytów "dostępny" zanim ogłosimy powrót (anty-miganie)
+const STATUS_FEED = "https://status.claude.com/api/v2/incidents/unresolved.json";
 
-const UNRESOLVED_URL = "https://status.claude.com/api/v2/incidents/unresolved.json";
-const MATCH = /fable\s*5/i;
-const HEARTBEAT_MS = HEARTBEAT_HOURS * 60 * 60 * 1000;
+// Defaults. Override WATCH_LABEL / WATCH_PATTERN via wrangler vars if needed.
+const DEFAULTS = {
+  label: "Fable 5",
+  pattern: "fable\\s*5",
+  heartbeatHours: 3, // remind that the model is still down on this cadence
+  heartbeatPings: false, // whether the heartbeat mentions you (mobile push)
+  confirmUp: 2, // consecutive "available" reads before announcing a recovery
+  confirmDown: 1, // consecutive "unavailable" reads before announcing an outage
+  unknownAlertChecks: 15, // consecutive failed status reads before warning once
+};
+
+const COLORS = { up: 0x2ecc71, down: 0xe67e22, blind: 0x95a5a6 };
 
 export default {
-  // Cron Trigger co 60 s.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(tick(env));
   },
 
-  // Pomocniczy endpoint do ręcznych testów (działa pod `wrangler dev`):
-  //   /?test=ping -> wysyła testowe powiadomienie    /  -> zwraca aktualny odczyt
+  // Helper endpoint for local development (wrangler dev):
+  //   /?test=ping  sends a sample notification
+  //   /            returns the current live reading as JSON
   async fetch(request, env) {
+    const cfg = config(env);
     const url = new URL(request.url);
     if (url.searchParams.get("test") === "ping") {
-      await notify(env, `<@${env.DISCORD_USER_ID}> 🔔 Test fable5-watcher — webhook działa.`, true);
+      await send(env, {
+        content: `<@${env.DISCORD_USER_ID}> Test notification`,
+        mention: true,
+        embeds: [{
+          title: `${cfg.label} watcher`,
+          description: "Webhook is working. This is a sample alert.",
+          color: COLORS.up,
+        }],
+      });
       return json({ ok: true, action: "test-ping" });
     }
-    return json(await checkStatus());
+    return json(await checkStatus(cfg.regex));
   },
 };
 
-// ── Detekcja ─────────────────────────────────────────────────────────────────
-// Zwraca { state: 'up' | 'down' | 'unknown', incident: {name, startedAt, url} | null }
-export async function checkStatus() {
-  try {
-    const res = await fetch(UNRESOLVED_URL, { headers: { "user-agent": "fable5-watcher" } });
-    if (!res.ok) {
-      console.log(`[check] status.claude.com -> HTTP ${res.status} -> unknown`);
-      return { state: "unknown", incident: null };
+// Detection. Returns { state: "up" | "down" | "unknown", incident: {...} | null }.
+export async function checkStatus(regex, attempts = 2) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(STATUS_FEED, { headers: { "user-agent": "claude-model-watcher" } });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const hit = (data.incidents || []).find((incident) => {
+        const text = (incident.name || "") + " " +
+          (incident.incident_updates || []).map((u) => u.body || "").join(" ");
+        return incident.status !== "resolved" && regex.test(text);
+      });
+      if (hit) {
+        return { state: "down", incident: { name: hit.name, startedAt: hit.started_at, url: hit.shortlink } };
+      }
+      return { state: "up", incident: null };
+    } catch (err) {
+      console.log(`status fetch failed (attempt ${i + 1}): ${err}`);
     }
-    const data = await res.json();
-    const hit = (data.incidents || []).find((i) => {
-      const text = (i.name || "") + " " + (i.incident_updates || []).map((u) => u.body || "").join(" ");
-      return i.status !== "resolved" && MATCH.test(text);
-    });
-    if (hit) {
-      console.log(`[check] aktywny incydent Fable 5 (status=${hit.status}) -> down`);
-      return { state: "down", incident: { name: hit.name, startedAt: hit.started_at, url: hit.shortlink } };
-    }
-    console.log("[check] brak incydentu Fable 5 -> up");
-    return { state: "up", incident: null };
-  } catch (err) {
-    console.log(`[check] błąd: ${err} -> unknown`);
-    return { state: "unknown", incident: null };
   }
+  return { state: "unknown", incident: null };
 }
 
-// ── Logika watchera (maszyna stanów + heartbeat) ─────────────────────────────
-export async function tick(env) {
-  const { state, incident } = await checkStatus();
+// Pure state machine. No I/O, fully unit testable.
+// Given the current reading and the previous persisted state, returns the next
+// state and the notifications that should be sent.
+export function decide({ reading, prev, now, cfg }) {
+  const s = { ...prev };
+  const out = [];
 
-  // Nie znamy stanu (np. strona statusu nieosiągalna) — nic nie zmieniamy i nie powiadamiamy.
-  if (state === "unknown") return;
+  if (reading === "unknown") {
+    s.unknownStreak = prev.unknownStreak + 1;
+    if (s.unknownStreak >= cfg.unknownAlertChecks && prev.unknownAlerted !== 1) {
+      out.push("blind");
+      s.unknownAlerted = 1;
+    }
+    return { state: s, notifications: out };
+  }
+
+  // Reading is known again.
+  s.unknownStreak = 0;
+  s.unknownAlerted = 0;
+
+  if (reading === "up") {
+    s.upStreak = prev.upStreak + 1;
+    s.downStreak = 0;
+  } else {
+    s.downStreak = prev.downStreak + 1;
+    s.upStreak = 0;
+  }
+
+  let desired = null;
+  if (reading === "up" && s.upStreak >= cfg.confirmUp) desired = "up";
+  else if (reading === "down" && s.downStreak >= cfg.confirmDown) desired = "down";
+  if (desired === null) return { state: s, notifications: out }; // wait for confirmation
+
+  if (desired !== prev.status) {
+    if (desired === "up") {
+      out.push("up");
+    } else if (prev.status === "up") {
+      out.push("down");
+      s.lastDownPing = now;
+    } else {
+      out.push("armed");
+      s.lastDownPing = now;
+    }
+    s.status = desired;
+    return { state: s, notifications: out };
+  }
+
+  if (desired === "down" && now - prev.lastDownPing >= cfg.heartbeatMs) {
+    out.push("heartbeat");
+    s.lastDownPing = now;
+  }
+  return { state: s, notifications: out };
+}
+
+// Worker wiring: read state, decide, persist, notify.
+async function tick(env) {
+  const cfg = config(env);
+  const { state: reading, incident } = await checkStatus(cfg.regex);
 
   const kv = env.FABLE_STATE;
+  const prev = {
+    status: (await kv.get("status")) || "",
+    upStreak: int(await kv.get("upStreak")),
+    downStreak: int(await kv.get("downStreak")),
+    lastDownPing: int(await kv.get("lastDownPing")),
+    unknownStreak: int(await kv.get("unknownStreak")),
+    unknownAlerted: int(await kv.get("unknownAlerted")),
+  };
+
   const now = Date.now();
-  const prev = (await kv.get("status")) || "";                       // '', 'up', 'down'
-  let upStreak = parseInt((await kv.get("upStreak")) || "0", 10);
-  let lastDownPing = parseInt((await kv.get("lastDownPing")) || "0", 10);
+  const { state, notifications } = decide({ reading, prev, now, cfg });
 
-  // Anty-miganie: powrót ogłaszamy dopiero po N kolejnych odczytach "up".
-  upStreak = state === "up" ? upStreak + 1 : 0;
-  await kv.put("upStreak", String(upStreak));
+  await Promise.all([
+    kv.put("status", state.status),
+    kv.put("upStreak", String(state.upStreak)),
+    kv.put("downStreak", String(state.downStreak)),
+    kv.put("lastDownPing", String(state.lastDownPing)),
+    kv.put("unknownStreak", String(state.unknownStreak)),
+    kv.put("unknownAlerted", String(state.unknownAlerted)),
+  ]);
 
-  // Stan docelowy: 'up' dopiero po potwierdzeniu; 'down' natychmiast; inaczej brak zmiany.
-  let desired = null;
-  if (state === "up" && upStreak >= CONFIRM_UP_CHECKS) desired = "up";
-  else if (state === "down") desired = "down";
-  if (desired === null) return; // "up" jeszcze niepotwierdzony — czekamy na kolejny odczyt
-
-  if (desired !== prev) {
-    // ── ZMIANA STANU ──
-    if (desired === "up") {
-      await notify(env, `<@${env.DISCORD_USER_ID}> 🎉 **Fable 5 jest znowu dostępny!** Incydent na status.claude.com rozwiązany. Sprawdź Claude Code / claude.ai.`, true);
-    } else {
-      // desired === 'down'
-      if (prev === "up") {
-        await notify(env, `<@${env.DISCORD_USER_ID}> ⚠️ **Fable 5 znów niedostępny**${incident ? ` — ${incident.name}` : ""}. Monitoruję dalej i dam znać, gdy wróci.`, true);
-      } else {
-        // pierwszy start watchera
-        await notify(env, `<@${env.DISCORD_USER_ID}> ✅ Watcher uzbrojony. **Fable 5 obecnie: NIEDOSTĘPNY**${incident ? ` (${incident.name})` : ""}. Powiadomię, gdy wróci. Status „wciąż niedostępny" co ${HEARTBEAT_HOURS} h.${incident && incident.url ? `\n${incident.url}` : ""}`, true);
-      }
-      lastDownPing = now;
-      await kv.put("lastDownPing", String(now));
-    }
-    await kv.put("status", desired);
-    return;
+  for (const kind of notifications) {
+    await send(env, buildMessage(kind, { cfg, env, incident, now, blindChecks: state.unknownStreak }));
   }
-
-  // ── BEZ ZMIANY STANU ──
-  if (desired === "down" && now - lastDownPing >= HEARTBEAT_MS) {
-    const since = incident && incident.startedAt ? ` (od ${incident.startedAt.slice(0, 10)})` : "";
-    await notify(env, `⏳ **Fable 5** wciąż niedostępny${since}. Monitoruję co 60 s; kolejny status za ${HEARTBEAT_HOURS} h.`, HEARTBEAT_PINGS_YOU);
-    await kv.put("lastDownPing", String(now));
-  }
-  // desired === 'up' i bez zmiany => cisza (żadnego spamu)
 }
 
-// ── Discord ──────────────────────────────────────────────────────────────────
-async function notify(env, content, mention) {
+function buildMessage(kind, { cfg, env, incident, now, blindChecks }) {
+  const id = env.DISCORD_USER_ID;
+  const link = incident && incident.url ? incident.url : undefined;
+  const source = { text: "Source: status.claude.com" };
+  const downSince = incident && incident.startedAt
+    ? `Down for ${humanDuration(now - Date.parse(incident.startedAt))}`
+    : undefined;
+
+  switch (kind) {
+    case "up":
+      return {
+        content: `<@${id}> ${cfg.label} is available again`,
+        mention: true,
+        embeds: [{
+          title: `${cfg.label} is available again`,
+          description: "The incident on the Claude status page has been resolved.",
+          color: COLORS.up, footer: source, timestamp: iso(now),
+        }],
+      };
+    case "down":
+      return {
+        content: `<@${id}> ${cfg.label} is unavailable again`,
+        mention: true,
+        embeds: [{
+          title: `${cfg.label} is unavailable again`,
+          description: incident ? incident.name : undefined,
+          url: link, color: COLORS.down, footer: source, timestamp: iso(now),
+        }],
+      };
+    case "armed":
+      return {
+        content: `<@${id}> ${cfg.label} watcher armed`,
+        mention: true,
+        embeds: [{
+          title: `${cfg.label} is currently unavailable`,
+          description: incident ? incident.name : "Watching for recovery.",
+          url: link, color: COLORS.down, footer: source, timestamp: iso(now),
+          fields: downSince ? [{ name: "Status", value: downSince }] : undefined,
+        }],
+      };
+    case "heartbeat":
+      return {
+        content: cfg.heartbeatPings ? `<@${id}> ${cfg.label} still unavailable` : `${cfg.label} still unavailable`,
+        mention: cfg.heartbeatPings,
+        embeds: [{
+          title: `${cfg.label} still unavailable`,
+          description: downSince, url: link, color: COLORS.down, footer: source, timestamp: iso(now),
+        }],
+      };
+    case "blind":
+      return {
+        content: "",
+        mention: false,
+        embeds: [{
+          title: "Claude status page unreachable",
+          description: `Could not read the status feed for ${blindChecks} consecutive checks. Detection is paused until it recovers.`,
+          color: COLORS.blind, footer: source, timestamp: iso(now),
+        }],
+      };
+    default:
+      return { content: "", mention: false, embeds: [] };
+  }
+}
+
+async function send(env, msg) {
   if (!env.DISCORD_WEBHOOK_URL) {
-    console.log("[notify] brak DISCORD_WEBHOOK_URL — pomijam");
+    console.log("DISCORD_WEBHOOK_URL is not set, skipping notification");
     return;
   }
+  const body = {
+    content: msg.content || "",
+    allowed_mentions: msg.mention && env.DISCORD_USER_ID
+      ? { parse: [], users: [env.DISCORD_USER_ID] }
+      : { parse: [] },
+  };
+  if (msg.embeds && msg.embeds.length) body.embeds = msg.embeds;
+
   const res = await fetch(env.DISCORD_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      content,
-      allowed_mentions: mention && env.DISCORD_USER_ID
-        ? { parse: [], users: [env.DISCORD_USER_ID] }
-        : { parse: [] },
-    }),
+    body: JSON.stringify(body),
   });
-  if (!res.ok) console.log(`[notify] Discord HTTP ${res.status}: ${await res.text()}`);
+  if (!res.ok) console.log(`Discord webhook returned ${res.status}: ${await res.text()}`);
 }
+
+function config(env) {
+  const heartbeatHours = num(env && env.HEARTBEAT_HOURS, DEFAULTS.heartbeatHours);
+  return {
+    label: (env && env.WATCH_LABEL) || DEFAULTS.label,
+    regex: new RegExp((env && env.WATCH_PATTERN) || DEFAULTS.pattern, "i"),
+    heartbeatMs: heartbeatHours * 60 * 60 * 1000,
+    heartbeatHours,
+    heartbeatPings: bool(env && env.HEARTBEAT_PINGS, DEFAULTS.heartbeatPings),
+    confirmUp: num(env && env.CONFIRM_UP, DEFAULTS.confirmUp),
+    confirmDown: num(env && env.CONFIRM_DOWN, DEFAULTS.confirmDown),
+    unknownAlertChecks: num(env && env.UNKNOWN_ALERT_CHECKS, DEFAULTS.unknownAlertChecks),
+  };
+}
+
+function humanDuration(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (!d && m) parts.push(`${m}m`);
+  return parts.join(" ") || "0m";
+}
+
+const int = (v) => parseInt(v || "0", 10) || 0;
+const num = (v, dflt) => (v === undefined || v === null || v === "" ? dflt : Number(v));
+const bool = (v, dflt) => (v === undefined || v === null || v === "" ? dflt : String(v) === "true");
+const iso = (ms) => new Date(ms).toISOString();
 
 function json(obj) {
   return new Response(JSON.stringify(obj, null, 2), {
