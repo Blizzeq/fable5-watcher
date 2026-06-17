@@ -1,0 +1,6 @@
+# Skopiuj ten plik do `.dev.vars` (gitignored) na potrzeby lokalnych testów `wrangler dev`.
+# W produkcji te wartości ustawiasz przez `wrangler secret put ...`, NIE tutaj.
+
+ANTHROPIC_API_KEY="sk-ant-..."
+DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/XXXX/YYYY"
+DISCORD_USER_ID="123456789012345678"

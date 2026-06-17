@@ -1,0 +1,17 @@
+{
+  "name": "fable5-watcher",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker, który co 60 s sprawdza dostępność modelu claude-fable-5 i pinguje na Discord, gdy wróci.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "dev:cron": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "check": "node --check src/index.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.40.0"
+  }
+}
